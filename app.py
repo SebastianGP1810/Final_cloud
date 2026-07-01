@@ -1,98 +1,224 @@
 import streamlit as st
-import os
 import pymongo
+import gridfs
+from google import genai
+from PyPDF2 import PdfReader
 import cohere
-import google.generativeai as genai
-from pypdf import PdfReader
-from datetime import datetime
-from dotenv import load_file
+import time
+import os
+from streamlit_pdf_viewer import pdf_viewer
 
-# Cargar .env solo si existe localmente (en Azure se leerá de las Application Settings)
-if os.path.exists(".env"):
-    load_file(".env")
+# =======================
+# CONFIGURACIÓN
+# =======================
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+MONGODB_URI = os.getenv("MONGODB_URI")
+COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+USER = os.getenv("USER", "")
 
-# ----------------- CONFIGURACIÓN EXAMEN -----------------
-# Modifica esto con tus datos reales para cumplir el enunciado
-USER_NAME = "Mendoza_Maria" 
-st.set_page_config(page_title=f"Chatbot EF - {USER_NAME}", layout="centered")
-st.title(f"🤖 Chatbot Inteligente RAG")
-st.subheader(f"Evaluación Final - {USER_NAME}")
-
-# ----------------- INICIALIZACIÓN DE SERVICIOS -----------------
-MONGO_URI = os.environ.get("MONGO_URI")
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
-COHERE_KEY = os.environ.get("COHERE_API_KEY")
-
-if not MONGO_URI or not GEMINI_KEY or not COHERE_KEY:
-    st.error("🚨 Faltan variables de entorno. Configura MONGO_URI, GEMINI_API_KEY y COHERE_API_KEY.")
+if not GOOGLE_API_KEY or not MONGODB_URI:
+    st.error("❌ Faltan GOOGLE_API_KEY o MONGODB_URI en secrets")
     st.stop()
 
-# Conexiones oficiales
-client = pymongo.MongoClient(MONGO_URI)
-db = client[f"db_ef_{USER_NAME.lower()}"]
-history_collection = db["chat_history"]
+gemini_client = genai.Client(api_key=GOOGLE_API_KEY)
+co = cohere.Client(COHERE_API_KEY)
 
-co = cohere.Client(COHERE_KEY)
-genai.configure(api_key=GEMINI_KEY)
-gemini_model = genai.GenerativeModel('gemini-pro')
+# MongoDB
+client = pymongo.MongoClient(MONGODB_URI)
+db = client["pdf_embeddings_db"]
+collection = db["pdf_vectors"]
+fs = gridfs.GridFS(db)
 
-# ----------------- PROCESAMIENTO RAG (PDF CHUNKS) -----------------
-uploaded_file = st.file_uploader("Subir el PDF Institucional para el contexto", type=["pdf"])
 
-pdf_context = ""
-if uploaded_file:
-    reader = PdfReader(uploaded_file)
-    text_content = ""
+def crear_indice_vectorial():
+    from pymongo.operations import SearchIndexModel
+    # Conexión a MongoDB Atlas
+    client = pymongo.MongoClient(MONGODB_URI)
+    db = client.pdf_embeddings_db
+    collection = db.pdf_vectors
+    collection.insert_one({"a":"sample"})
+
+    existing_indexes = [idx["name"] for idx in collection.list_search_indexes()]
+    if "vector_index" in existing_indexes:
+        return
+
+    search_index_model = SearchIndexModel(
+        definition={
+            "fields": [
+                {
+                    "type": "vector",
+                    "path": "embedding",
+                    "similarity": "cosine",
+                    "numDimensions": 1024,
+                }
+            ]
+        },
+        name="vector_index",
+        type="vectorSearch",
+    )
+
+    collection.create_search_index(model=search_index_model)
+    time.sleep(20)
+
+
+crear_indice_vectorial()
+
+# =======================
+# FUNCIONES PDF + EMBEDDING
+# =======================
+
+def leer_pdf(archivo):
+    reader = PdfReader(archivo)
+    texto = ""
     for page in reader.pages:
-        text_content += page.extract_text() or ""
-    
-    # Fragmentar en bloques simples (Chunks) para emular la inyección contextual
-    if text_content:
-        pdf_context = text_content[:3000] # Tomamos los primeros caracteres como contexto simplificado
-        st.success("✅ PDF cargado e indexado en memoria con éxito.")
+        texto += (page.extract_text() or "") + "\n"
+    return texto.strip()
 
-# ----------------- INTERFAZ DE CONVERSACIÓN -----------------
-if "messages" not in st.session_state:
-    st.session_state.messages = []
 
-# Mostrar el historial visual en Streamlit
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+def crear_embedding(texto, input_type="search_document"):
+    """Genera embeddings usando Cohere v3 (multilenguaje, 1024 dim)."""
+    resp = co.embed(
+        model="embed-multilingual-v3.0",
+        texts=[texto],
+        input_type=input_type,
+    )
+    return resp.embeddings[0]
 
-# Entrada de usuario
-if user_query := st.chat_input("Pregúntale al bot sobre el documento..."):
-    # 1. Mostrar mensaje del usuario en pantalla
-    with st.chat_message("user"):
-        st.markdown(user_query)
-    st.session_state.messages.append({"role": "user", "content": user_query})
 
-    # 2. Construir prompt RAG inyectando el contexto semántico
-    full_prompt = f"Contexto extraído del documento:\n{pdf_context}\n\nPregunta del usuario: {user_query}\nResponde de manera precisa basándote solo en el contexto."
+def procesar_pdf(archivo_pdf, nombre_pdf):
+    """Lee PDF, genera embeddings y guarda texto + PDF en MongoDB."""
+    st.info("📄 Leyendo PDF...")
 
-    # 3. Simular llamada combinada (Cohere para análisis/Gemini para respuesta)
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        try:
-            # Cohere valida/procesa internamente el input (emulación de embeddings)
-            co.tokenize(text=user_query)
-            
-            # Gemini genera la respuesta final basada en el contexto del PDF
-            response = gemini_model.generate_content(full_prompt)
-            bot_response = response.text
-            
-            message_placeholder.markdown(bot_response)
-            st.session_state.messages.append({"role": "assistant", "content": bot_response})
-            
-            # 4. GUARDAR EN SISTEMA DE REGISTRO (MongoDB PaaS)
-            log_document = {
-                "user_student": USER_NAME,
-                "timestamp": datetime.utcnow(),
-                "query": user_query,
-                "response": bot_response,
-                "has_context": bool(pdf_context)
+    texto = leer_pdf(archivo_pdf)
+    if not texto:
+        st.error("El PDF no contiene texto.")
+        return None
+
+    trozos = [texto[i:i + 1000] for i in range(0, len(texto), 1000)]
+
+    documentos = []
+    for i, chunk in enumerate(trozos):
+        embedding = crear_embedding(chunk)
+        documentos.append({
+            "pdf": nombre_pdf,
+            "id": i,
+            "texto": chunk,
+            "embedding": embedding,
+        })
+
+    collection.insert_many(documentos)
+
+    # Guardar PDF en GridFS (reemplaza a Backblaze)
+    st.info("📤 Guardando PDF en MongoDB...")
+    if fs.exists({"filename": nombre_pdf}):
+        for f in fs.find({"filename": nombre_pdf}):
+            fs.delete(f._id)
+    fs.put(archivo_pdf.getvalue(), filename=nombre_pdf, content_type="application/pdf")
+
+    return len(documentos)
+
+# =======================
+# VISOR PDF DESDE MONGODB
+# =======================
+
+def obtener_pdf(nombre_pdf):
+    """Devuelve los bytes del PDF almacenado en GridFS."""
+    archivo = fs.find_one({"filename": nombre_pdf})
+    return archivo.read() if archivo else None
+
+
+def mostrar_pdf(pdf_bytes):
+    """Muestra PDF embebido con pdf.js (compatible con Chrome)."""
+    pdf_viewer(input=pdf_bytes, width=700)
+
+# =======================
+# VECTOR SEARCH + CHAT
+# =======================
+
+def buscar_similares(embedding, k=5):
+    pipeline = [
+        {
+            "$vectorSearch": {
+                "index": "vector_index",
+                "path": "embedding",
+                "queryVector": embedding,
+                "numCandidates": 100,
+                "limit": k,
             }
-            history_collection.insert_one(log_document)
-            
-        except Exception as e:
-            st.error(f"Error procesando los servicios de IA/Nube: {e}")
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "texto": 1,
+                "score": {"$meta": "vectorSearchScore"},
+            }
+        },
+    ]
+    return list(collection.aggregate(pipeline))
+
+
+def generar_respuesta(pregunta, contextos):
+    contexto = "\n\n".join([c["texto"] for c in contextos])
+    prompt = f"""
+Usa el contexto para responder la pregunta.
+
+Contexto:
+{contexto}
+
+Pregunta: {pregunta}
+
+Responde en español, de forma clara.
+"""
+    respuesta = gemini_client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+    )
+    return respuesta.text
+
+# =======================
+# INTERFAZ STREAMLIT
+# =======================
+
+st.set_page_config(page_title="ChatBot", page_icon="📚")
+st.title("📚 Chat con PDFs en MongoDB + Gemini + Cohere: " + USER)
+
+archivo_pdf = st.file_uploader("📤 Sube un PDF", type=["pdf"])
+
+if archivo_pdf:
+    if st.button("Procesar y guardar PDF"):
+        with st.spinner("Procesando PDF..."):
+            cantidad = procesar_pdf(archivo_pdf, archivo_pdf.name)
+            st.success(f"Procesado: {cantidad} fragmentos generados y PDF guardado.")
+
+        st.info("📖 Vista previa del PDF desde MongoDB:")
+        pdf_bytes = obtener_pdf(archivo_pdf.name)
+        if pdf_bytes:
+            mostrar_pdf(pdf_bytes)
+
+# ---------------- Chat ----------------
+
+st.subheader("💬 Pregunta sobre el contenido del PDF")
+
+if "historial" not in st.session_state:
+    st.session_state.historial = []
+
+pregunta = st.chat_input("Escribe tu pregunta...")
+
+if pregunta:
+    with st.spinner("Buscando en el PDF..."):
+        emb = crear_embedding(pregunta, input_type="search_query")
+        similares = buscar_similares(emb)
+
+        if not similares:
+            respuesta = "No encontré información relevante."
+        else:
+            respuesta = generar_respuesta(pregunta, similares)
+
+        st.session_state.historial.append({"rol": "usuario", "texto": pregunta})
+        st.session_state.historial.append({"rol": "bot", "texto": respuesta})
+
+for msg in st.session_state.historial:
+    if msg["rol"] == "usuario":
+        st.chat_message("user").write(msg["texto"])
+    else:
+        st.chat_message("assistant").write(msg["texto"])
