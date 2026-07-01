@@ -1,18 +1,24 @@
-# Capa 1: Imagen base oficial de Python ligera
-FROM python:3.9-slim
+# Usar imagen base de Python
+FROM python:3.11-slim
 
-# Capa 2: Directorio de trabajo aislado dentro del contenedor
+# Establecer directorio de trabajo
 WORKDIR /app
 
-# Capa 3: Copiar la lista de dependencias y ejecutarlas
+# Copiar requirements primero (para optimizar cache)
 COPY requirements.txt .
+
+# Instalar dependencias
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Capa 4: Copiar todo el código de nuestra app al contenedor
-COPY . .
+# Copiar el código de la aplicación
+COPY app_ef.py .
 
-# Capa 5: Indicar que la app escucha internamente en el puerto de Streamlit
+# Exponer puerto 8501 (puerto por defecto de Streamlit)
 EXPOSE 8501
 
-# Capa 6: Comando de arranque apuntando a la IP de escucha global en producción
-CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+# Configurar Streamlit para producción
+ENV STREAMLIT_SERVER_PORT=8501
+ENV STREAMLIT_SERVER_ADDRESS=0.0.0.0
+
+# Comando para ejecutar la aplicación
+CMD ["streamlit", "run", "app_ef.py", "--server.port=8501", "--server.address=0.0.0.0"]
